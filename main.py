@@ -2,11 +2,31 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog
 from typing import Callable, Dict, List, Optional
+
+# Windows DPI awareness constant (PROCESS_SYSTEM_DPI_AWARE)
+_DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = 1
+
+# Startup rendering timing constant (milliseconds)
+_WINDOW_DEICONIFY_DELAY_MS = 100
+
+# Tk scaling factor for DPI blur prevention
+_TK_SCALING_FACTOR = 1.0
+
+# Enable high-DPI awareness on Windows BEFORE importing customtkinter
+# This prevents scaling blurriness and rendering artifacts
+if sys.platform == "win32":
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(_DPI_AWARENESS_CONTEXT_SYSTEM_AWARE)
+    except (OSError, AttributeError):
+        # DPI awareness API may not be available on older Windows versions
+        pass
 
 import customtkinter as ctk
 try:
@@ -71,6 +91,12 @@ C_DOT_ERROR = ("#ef4444", "#ef4444")
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
+
+        # Prevent showing uninitialized window state during widget construction
+        self.withdraw()
+
+        # Disable DPI scaling to prevent blur/flicker on high-DPI displays
+        self.tk.call('tk', 'scaling', _TK_SCALING_FACTOR)
 
         self.title("MP3 Tag Editor")
         self.geometry("1080x700")
@@ -1718,4 +1744,7 @@ class _ConfirmDialog(ctk.CTkToplevel):
 
 if __name__ == "__main__":
     app = App()
+    # Show window after event loop is ready and all widgets are laid out
+    # Delay allows Tkinter to process layout before rendering visible window
+    app.after(_WINDOW_DEICONIFY_DELAY_MS, app.deiconify)
     app.mainloop()
