@@ -15,8 +15,18 @@ _DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = 1
 # Startup rendering timing constant (milliseconds)
 _WINDOW_DEICONIFY_DELAY_MS = 100
 
+# Debounce delay for the file/folder filter so tree visibility is not
+# recomputed on every keystroke (milliseconds)
+_SEARCH_DEBOUNCE_MS = 200
+
 # Tk scaling factor for DPI blur prevention
 _TK_SCALING_FACTOR = 1.0
+
+# Resizable layout: folder-tree (left) panel width bounds and splitter, in pixels
+_LEFT_PANEL_DEFAULT_WIDTH = 340
+_LEFT_PANEL_MIN_WIDTH = 260
+_EDITOR_PANEL_MIN_WIDTH = 380
+_SPLITTER_WIDTH = 10
 
 # Enable high-DPI awareness on Windows BEFORE importing customtkinter
 # This prevents scaling blurriness and rendering artifacts
@@ -88,6 +98,70 @@ C_DOT_BUSY = ("#f59e0b", "#f59e0b")
 C_DOT_ERROR = ("#ef4444", "#ef4444")
 
 
+class _LoadingOverlay(ctk.CTkFrame):
+    """Animated loading overlay for file tree."""
+
+    _SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
+    _ANIM_INTERVAL_MS = 120
+
+    def __init__(
+        self,
+        parent: ctk.CTkFrame,
+        font: ctk.CTkFont,
+        font_small: ctk.CTkFont,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            parent,
+            fg_color=C_SURFACE,
+            corner_radius=0,
+            **kwargs,
+        )
+        self.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 8))
+
+        # Center container
+        inner = ctk.CTkFrame(self, fg_color="transparent")
+        inner.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Spinner label
+        self._spinner_label = ctk.CTkLabel(
+            inner,
+            text="◐",
+            font=ctk.CTkFont(family=font.cget("family"), size=32),
+            text_color=C_ACCENT,
+        )
+        self._spinner_label.pack(pady=(0, 8))
+
+        # Loading text
+        ctk.CTkLabel(
+            inner,
+            text="กำลังโหลดไฟล์...",
+            font=font_small,
+            text_color=C_MUTED,
+        ).pack()
+
+        self._frame_idx = 0
+        self._job: Optional[str] = None
+
+    def show(self) -> None:
+        """Show the loading overlay and start animation."""
+        self.tkraise()
+        self._animate()
+
+    def hide(self) -> None:
+        """Hide the loading overlay and stop animation."""
+        if self._job is not None:
+            self.after_cancel(self._job)
+            self._job = None
+        self.grid_remove()
+
+    def _animate(self) -> None:
+        """Animate the spinner."""
+        self._frame_idx = (self._frame_idx + 1) % len(self._SPINNER_FRAMES)
+        self._spinner_label.configure(text=self._SPINNER_FRAMES[self._frame_idx])
+        self._job = self.after(self._ANIM_INTERVAL_MS, self._animate)
+
+
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -107,6 +181,9 @@ class App(ctk.CTk):
         self._font = ctk.CTkFont(family=self._font_family, size=13)
         self._font_small = ctk.CTkFont(family=self._font_family, size=12)
         self._font_xsmall = ctk.CTkFont(family=self._font_family, size=11)
+        self._font_small_bold = ctk.CTkFont(
+            family=self._font_family, size=12, weight="bold"
+        )
         self._font_heading = ctk.CTkFont(
             family=self._font_family, size=13, weight="bold"
         )
@@ -125,6 +202,9 @@ class App(ctk.CTk):
         self._folder_rows: Dict[str, _FolderRow] = {}
         self._folder_descendants: Dict[str, List[_FileRow]] = {}
         self._cancel_load = threading.Event()
+        self._search_job: Optional[str] = None
+        self._left_width = _LEFT_PANEL_DEFAULT_WIDTH
+        self._splitter_dragging = False
 
         self._build_ui()
 
@@ -140,11 +220,16 @@ class App(ctk.CTk):
 
         content = ctk.CTkFrame(self, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=12, pady=(8, 0))
-        content.columnconfigure(0, weight=5, minsize=280)
-        content.columnconfigure(1, weight=7, minsize=420)
+        self._content = content
+        # Column 0 = folder tree (fixed width, adjusted by the splitter drag),
+        # column 1 = draggable splitter, column 2 = tag editor (absorbs slack).
+        content.columnconfigure(0, weight=0, minsize=self._left_width)
+        content.columnconfigure(1, weight=0)
+        content.columnconfigure(2, weight=1, minsize=_EDITOR_PANEL_MIN_WIDTH)
         content.rowconfigure(0, weight=1)
 
         self._build_file_panel(content)
+        self._build_splitter(content)
         self._build_editor_panel(content)
         self._build_status_bar()
 
@@ -204,18 +289,18 @@ class App(ctk.CTk):
         ctk.CTkFrame(self, height=1, fg_color=C_BORDER, corner_radius=0).pack(fill="x")
 
     def _build_file_panel(self, parent: ctk.CTkFrame) -> None:
-        panel = ctk.CTkFrame(
+        self._file_panel = ctk.CTkFrame(
             parent,
             fg_color=C_SURFACE,
             corner_radius=12,
             border_width=1,
             border_color=C_BORDER,
         )
-        panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
-        panel.rowconfigure(2, weight=1)
-        panel.columnconfigure(0, weight=1)
+        self._file_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 0), pady=(0, 8))
+        self._file_panel.rowconfigure(2, weight=1)
+        self._file_panel.columnconfigure(0, weight=1)
 
-        header = ctk.CTkFrame(panel, fg_color="transparent")
+        header = ctk.CTkFrame(self._file_panel, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 0))
         header.columnconfigure(1, weight=1)
 
@@ -255,10 +340,10 @@ class App(ctk.CTk):
         self._select_all_button.grid(row=0, column=2, sticky="e")
 
         self._search_var = tk.StringVar()
-        self._search_var.trace_add("write", lambda *_: self._apply_tree_visibility())
+        self._search_var.trace_add("write", lambda *_: self._schedule_tree_filter())
 
         ctk.CTkEntry(
-            panel,
+            self._file_panel,
             textvariable=self._search_var,
             placeholder_text="Filter files or folders",
             font=self._font_small,
@@ -271,7 +356,7 @@ class App(ctk.CTk):
         ).grid(row=1, column=0, sticky="ew", padx=12, pady=(8, 6))
 
         self._tree_frame = ctk.CTkScrollableFrame(
-            panel,
+            self._file_panel,
             fg_color=C_SURFACE,
             scrollbar_button_color=C_BORDER,
             scrollbar_button_hover_color=C_MUTED,
@@ -279,6 +364,61 @@ class App(ctk.CTk):
         )
         self._tree_frame.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 8))
         self._tree_frame.columnconfigure(0, weight=1)
+
+        # Create and set up loading overlay
+        self._loading_overlay = _LoadingOverlay(
+            self._file_panel,
+            font=self._font,
+            font_small=self._font_small,
+        )
+
+    def _build_splitter(self, parent: ctk.CTkFrame) -> None:
+        """Draggable divider that resizes the folder-tree panel."""
+        grip = ctk.CTkFrame(parent, width=_SPLITTER_WIDTH, fg_color="transparent")
+        grip.grid(row=0, column=1, sticky="ns", pady=(0, 8))
+        grip.grid_propagate(False)
+        grip.configure(cursor="sb_h_double_arrow")
+
+        # Centered handle that highlights on hover/drag.
+        self._splitter_handle = ctk.CTkFrame(
+            grip, width=4, fg_color=C_BORDER, corner_radius=2
+        )
+        self._splitter_handle.place(relx=0.5, rely=0.5, anchor="center", relheight=0.4)
+        self._splitter_handle.configure(cursor="sb_h_double_arrow")
+
+        for widget in (grip, self._splitter_handle):
+            widget.bind("<Enter>", lambda _e: self._set_splitter_active(True))
+            widget.bind("<Leave>", lambda _e: self._set_splitter_active(False))
+            widget.bind("<ButtonPress-1>", self._start_splitter_drag)
+            widget.bind("<B1-Motion>", self._on_splitter_drag)
+            widget.bind("<ButtonRelease-1>", self._end_splitter_drag)
+
+    def _set_splitter_active(self, active: bool) -> None:
+        color = C_ACCENT if (active or self._splitter_dragging) else C_BORDER
+        self._splitter_handle.configure(fg_color=color)
+
+    def _start_splitter_drag(self, event) -> None:
+        self._splitter_dragging = True
+        self._drag_origin_x = event.x_root
+        self._drag_origin_width = self._left_width
+        self._set_splitter_active(True)
+
+    def _on_splitter_drag(self, event) -> None:
+        if not self._splitter_dragging:
+            return
+        delta = event.x_root - self._drag_origin_x
+        available = self._content.winfo_width() - _SPLITTER_WIDTH - _EDITOR_PANEL_MIN_WIDTH
+        max_width = max(_LEFT_PANEL_MIN_WIDTH, available)
+        new_width = max(
+            _LEFT_PANEL_MIN_WIDTH, min(self._drag_origin_width + delta, max_width)
+        )
+        if new_width != self._left_width:
+            self._left_width = new_width
+            self._content.columnconfigure(0, minsize=new_width)
+
+    def _end_splitter_drag(self, _event) -> None:
+        self._splitter_dragging = False
+        self._set_splitter_active(False)
 
     def _build_editor_panel(self, parent: ctk.CTkFrame) -> None:
         panel = ctk.CTkFrame(
@@ -288,7 +428,7 @@ class App(ctk.CTk):
             border_width=1,
             border_color=C_BORDER,
         )
-        panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 8))
+        panel.grid(row=0, column=2, sticky="nsew", padx=(0, 0), pady=(0, 8))
         panel.rowconfigure(1, weight=1)
         panel.columnconfigure(0, weight=1)
 
@@ -636,13 +776,40 @@ class App(ctk.CTk):
         self._count_label.pack(side="right", padx=(0, 14))
 
     def _pick_folder(self) -> None:
-        folder = filedialog.askdirectory(title="Select folder with MP3 files")
+        folder = self._ask_directory()
         if not folder:
             return
 
         self._folder_path = folder
         self._path_label.configure(text=self._shorten_path(folder))
         self._load_folder(folder)
+
+    def _ask_directory(self) -> str:
+        """Open the folder picker, guarding against the intermittent Windows
+        'Unspecified error' from the native shell directory dialog.
+
+        Passing an explicit parent window and a valid initial directory avoids
+        the most common triggers; a single retry covers transient COM/shell
+        races. On repeated failure we surface a status message instead of
+        crashing the app with an unhandled TclError.
+        """
+        initial_dir = self._folder_path or os.path.expanduser("~")
+        last_error: Optional[tk.TclError] = None
+        for _attempt in range(2):
+            try:
+                return filedialog.askdirectory(
+                    parent=self,
+                    title="Select folder with MP3 files",
+                    initialdir=initial_dir,
+                    mustexist=True,
+                )
+            except tk.TclError as exc:
+                last_error = exc
+        self._set_status(
+            f"Could not open the folder dialog ({last_error}). Please try again.",
+            state="error",
+        )
+        return ""
 
     def _shorten_path(self, path: str) -> str:
         if len(path) <= 72:
@@ -656,9 +823,12 @@ class App(ctk.CTk):
         selected_path: Optional[str] = None,
         checked_paths: Optional[set[str]] = None,
     ) -> None:
+        # Cancel any in-progress load
         self._cancel_load.set()
         self._cancel_load = threading.Event()
+        cancel_event = self._cancel_load
 
+        # Clear existing rows immediately
         for row in self._all_rows:
             row.destroy()
 
@@ -676,59 +846,88 @@ class App(ctk.CTk):
         self._clear_form()
         self._show_current_cover(None)
 
-        entries = list_mp3_tree(folder)
-        if not entries:
-            self._tree_badge.configure(text="0 files")
-            self._count_label.configure(text="")
-            self._set_status("No MP3 files found in this folder", state="error")
-            return
+        # Show loading overlay and set busy status
+        self._loading_overlay.show()
+        self._set_status("กำลังโหลดไฟล์...", state="busy")
 
-        for row_index, entry in enumerate(entries):
-            if entry.kind == "folder":
-                row = _FolderRow(
-                    self._tree_frame,
-                    row_index=row_index,
-                    entry=entry,
-                    font=self._font_small,
-                    on_toggle=self._on_folder_toggle,
-                    on_check=self._on_folder_check,
-                )
-                self._folder_rows[entry.relative_path] = row
-            else:
-                row = _FileRow(
-                    self._tree_frame,
-                    row_index=row_index,
-                    entry=entry,
-                    font=self._font_small,
-                    on_select=self._on_file_select,
-                    on_check=self._on_check_change,
-                )
-                self._file_rows.append(row)
+        def _do_load() -> Optional[list]:
+            """Load entries in background thread."""
+            entries = list_mp3_tree(folder)
+            if cancel_event.is_set():
+                return None
+            return entries
 
-            self._all_rows.append(row)
+        def _finish(entries: Optional[list]) -> None:
+            """Finish loading on main thread."""
+            self._loading_overlay.hide()
 
-        if checked_paths is not None:
-            for row in self._file_rows:
-                row.set_checked(row.entry.path in checked_paths)
+            if entries is None or not entries:
+                self._tree_badge.configure(text="0 files")
+                self._count_label.configure(text="")
+                self._set_status("No MP3 files found in this folder", state="error")
+                return
 
-        self._build_folder_descendants()
-        self._refresh_folder_selection_states()
-        self._apply_tree_visibility()
-        self._set_status(
-            f"Loaded {len(self._file_rows)} MP3 files from subfolders",
-            state="ok",
-        )
+            # Build rows
+            for row_index, entry in enumerate(entries):
+                if entry.kind == "folder":
+                    row = _FolderRow(
+                        self._tree_frame,
+                        row_index=row_index,
+                        entry=entry,
+                        font=self._font_small_bold,
+                        on_toggle=self._on_folder_toggle,
+                        on_check=self._on_folder_check,
+                    )
+                    self._folder_rows[entry.relative_path] = row
+                else:
+                    row = _FileRow(
+                        self._tree_frame,
+                        row_index=row_index,
+                        entry=entry,
+                        font=self._font_small,
+                        on_select=self._on_file_select,
+                        on_check=self._on_check_change,
+                    )
+                    self._file_rows.append(row)
 
-        target_row = None
-        if selected_path:
-            target_row = next(
-                (row for row in self._file_rows if row.entry.path == selected_path),
-                None,
+                self._all_rows.append(row)
+
+            # Restore checkbox states
+            if checked_paths is not None:
+                for row in self._file_rows:
+                    row.set_checked(row.entry.path in checked_paths)
+
+            # Finalize tree structure
+            self._build_folder_descendants()
+            self._refresh_folder_selection_states()
+            self._apply_tree_visibility()
+            self._set_status(
+                f"Loaded {len(self._file_rows)} MP3 files from subfolders",
+                state="ok",
             )
-        if target_row is None and self._file_rows:
-            target_row = self._file_rows[0]
-        if target_row is not None:
-            self._on_file_select(target_row.entry.path, target_row)
+
+            # Select target row
+            target_row = None
+            if selected_path:
+                target_row = next(
+                    (row for row in self._file_rows if row.entry.path == selected_path),
+                    None,
+                )
+            if target_row is None and self._file_rows:
+                target_row = self._file_rows[0]
+            if target_row is not None:
+                self._on_file_select(target_row.entry.path, target_row)
+
+        # Start background load
+        def worker() -> None:
+            try:
+                entries = _do_load()
+                self.after(0, lambda: _finish(entries))
+            except Exception as e:
+                self._loading_overlay.hide()
+                self._set_status(f"Error loading folder: {e}", state="error")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _ancestor_paths(self, relative_path: str) -> List[str]:
         ancestors: List[str] = []
@@ -1072,6 +1271,21 @@ class App(ctk.CTk):
         search_text = row.entry.relative_path.replace("\\", "/").lower()
         return query in search_text
 
+    def _schedule_tree_filter(self) -> None:
+        """Debounce filter input so visibility recomputes once typing settles.
+
+        Each keystroke reschedules a single ``after`` job instead of running the
+        O(folders x rows) visibility pass immediately, keeping typing smooth on
+        large folder trees.
+        """
+        if self._search_job is not None:
+            self.after_cancel(self._search_job)
+        self._search_job = self.after(_SEARCH_DEBOUNCE_MS, self._run_tree_filter)
+
+    def _run_tree_filter(self) -> None:
+        self._search_job = None
+        self._apply_tree_visibility()
+
     def _apply_tree_visibility(self) -> None:
         query = self._search_var.get().strip().lower()
 
@@ -1364,7 +1578,7 @@ class _FolderRow(_TreeRowBase):
             self,
             text="",
             variable=self._checked_var,
-            width=24,
+            width=18,
             checkbox_width=16,
             checkbox_height=16,
             fg_color=C_ACCENT,
@@ -1373,8 +1587,7 @@ class _FolderRow(_TreeRowBase):
             border_color=C_BORDER,
             command=self._checkbox_toggled,
         )
-        self._checkbox.grid(row=0, column=0, padx=(10, 6), pady=4)
-        self._checkbox.grid_configure(column=1, padx=(0, 6))
+        self._checkbox.grid(row=0, column=1, padx=(0, 2), pady=4)
 
         self._button = ctk.CTkButton(
             self,
@@ -1384,7 +1597,7 @@ class _FolderRow(_TreeRowBase):
             fg_color="transparent",
             hover_color=C_ROW_HOVER,
             text_color=C_TEXT,
-            corner_radius=8,
+            corner_radius=6,
             height=30,
             command=self._toggle,
         )
@@ -1401,9 +1614,9 @@ class _FolderRow(_TreeRowBase):
             text="",
             font=font,
             text_color=C_MUTED,
-            width=20,
+            width=14,
         )
-        self._branch_label.grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self._branch_label.grid(row=0, column=2, sticky="w", padx=(0, 2))
 
         self._count_label = ctk.CTkLabel(
             self,
@@ -1471,7 +1684,7 @@ class _FileRow(_TreeRowBase):
             self,
             text="",
             variable=self._checked_var,
-            width=24,
+            width=18,
             checkbox_width=16,
             checkbox_height=16,
             fg_color=C_ACCENT,
@@ -1480,22 +1693,11 @@ class _FileRow(_TreeRowBase):
             border_color=C_BORDER,
             command=self._check_changed,
         )
-        self._checkbox.grid(
-            row=0,
-            column=1,
-            padx=(0, 6),
-            pady=4,
-        )
+        self._checkbox.grid(row=0, column=1, padx=(0, 2), pady=4)
 
-        self._branch_label = ctk.CTkLabel(
-            self,
-            text="•",
-            font=font,
-            text_color=C_MUTED,
-            width=20,
-        )
-        self._branch_label.grid(row=0, column=2, sticky="w", padx=(0, 6))
-
+        # Files carry no leading marker: the name sits right next to the
+        # checkbox. Spans the marker + name columns so it stays tight while
+        # hierarchy is conveyed by the depth indent in column 0.
         self._button = ctk.CTkButton(
             self,
             text=entry.name,
@@ -1504,11 +1706,13 @@ class _FileRow(_TreeRowBase):
             fg_color="transparent",
             hover_color=C_ROW_HOVER,
             text_color=C_TEXT,
-            corner_radius=8,
+            corner_radius=6,
             height=30,
             command=lambda: self._on_select(entry.path, self),
         )
-        self._button.grid(row=0, column=3, sticky="ew", padx=(0, 8), pady=2)
+        self._button.grid(
+            row=0, column=2, columnspan=2, sticky="ew", padx=(2, 8), pady=2
+        )
 
         for widget in (self, self._button):
             widget.bind("<Enter>", lambda _event: self._set_hover(True))
