@@ -22,6 +22,15 @@ _SEARCH_DEBOUNCE_MS = 200
 # Tk scaling factor for DPI blur prevention
 _TK_SCALING_FACTOR = 1.0
 
+# Fixed height (px) of a single tree row. The folder tree is virtualized: only
+# the rows in the current viewport are rendered, so a constant row height lets us
+# map a scroll offset directly to a model index range. Keep this in sync with the
+# row's internal widget heights (checkbox 16px / name button 30px sit inside it).
+_TREE_ROW_HEIGHT = 33
+
+# How many model rows a single mouse-wheel notch scrolls.
+_TREE_WHEEL_ROWS = 3
+
 # Resizable layout: folder-tree (left) panel width bounds and splitter, in pixels
 _LEFT_PANEL_DEFAULT_WIDTH = 340
 _LEFT_PANEL_MIN_WIDTH = 260
@@ -92,6 +101,7 @@ C_ACCENT_HOVER = ("#1d4ed8", "#60a5fa")
 C_SUCCESS = ("#16a34a", "#22c55e")
 C_SUCCESS_HOVER = ("#15803d", "#4ade80")
 C_ROW_SELECTED = ("#dbeafe", "#1d3a6e")
+C_ROW_SELECTED_TEXT = ("#1d4ed8", "#93c5fd")
 C_ROW_HOVER = ("#eef4ff", "#1a2744")
 C_DOT_OK = ("#22c55e", "#22c55e")
 C_DOT_BUSY = ("#f59e0b", "#f59e0b")
@@ -197,10 +207,19 @@ class App(ctk.CTk):
         self._cover_preview_photo = None
         self._rename_entry: Optional[ctk.CTkEntry] = None
         self._file_drafts: Dict[str, Dict[str, str]] = {}
-        self._all_rows: List[_TreeRowBase] = []
-        self._file_rows: List[_FileRow] = []
-        self._folder_rows: Dict[str, _FolderRow] = {}
-        self._folder_descendants: Dict[str, List[_FileRow]] = {}
+
+        # Tree data model — STATE lives here, not inside widgets. The view
+        # (`self._tree`, a virtualized widget pool) renders only what is visible.
+        # `_tree_entries` is the full ordered scan; the derived collections below
+        # are rebuilt on every folder load. (Note: `self._entries`, set later in
+        # `_build_editor_panel`, is the unrelated tag-editor form-field map.)
+        self._tree_entries: List[MP3TreeEntry] = []
+        self._file_entries: List[MP3TreeEntry] = []
+        self._folder_entries: Dict[str, MP3TreeEntry] = {}
+        self._checked: Dict[str, bool] = {}            # file abs path -> checked
+        self._expanded: Dict[str, bool] = {}           # folder rel path -> expanded
+        self._folder_descendants: Dict[str, List[MP3TreeEntry]] = {}
+        self._visible_entries: List[MP3TreeEntry] = []
         self._cancel_load = threading.Event()
         self._search_job: Optional[str] = None
         self._left_width = _LEFT_PANEL_DEFAULT_WIDTH
@@ -355,15 +374,15 @@ class App(ctk.CTk):
             corner_radius=8,
         ).grid(row=1, column=0, sticky="ew", padx=12, pady=(8, 6))
 
-        self._tree_frame = ctk.CTkScrollableFrame(
+        self._tree = _VirtualTree(
             self._file_panel,
-            fg_color=C_SURFACE,
-            scrollbar_button_color=C_BORDER,
-            scrollbar_button_hover_color=C_MUTED,
-            corner_radius=0,
+            bind_row=self._bind_tree_row,
+            on_check=self._on_row_check,
+            on_click=self._on_row_click,
+            font=self._font_small,
+            font_bold=self._font_small_bold,
         )
-        self._tree_frame.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 8))
-        self._tree_frame.columnconfigure(0, weight=1)
+        self._tree.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 8))
 
         # Create and set up loading overlay
         self._loading_overlay = _LoadingOverlay(
@@ -828,14 +847,16 @@ class App(ctk.CTk):
         self._cancel_load = threading.Event()
         cancel_event = self._cancel_load
 
-        # Clear existing rows immediately
-        for row in self._all_rows:
-            row.destroy()
-
-        self._all_rows.clear()
-        self._file_rows.clear()
-        self._folder_rows.clear()
-        self._folder_descendants.clear()
+        # Clear the model immediately. The view reuses its recycled widget pool,
+        # so we only blank out the data — no per-row widget destruction.
+        self._tree_entries = []
+        self._file_entries = []
+        self._folder_entries = {}
+        self._checked = {}
+        self._expanded = {}
+        self._folder_descendants = {}
+        self._visible_entries = []
+        self._tree.set_items([], reset=True)
         self._file_drafts.clear()
         self._selected_file = None
         self._selected_cover = None
@@ -867,56 +888,41 @@ class App(ctk.CTk):
                 self._set_status("No MP3 files found in this folder", state="error")
                 return
 
-            # Build rows
-            for row_index, entry in enumerate(entries):
-                if entry.kind == "folder":
-                    row = _FolderRow(
-                        self._tree_frame,
-                        row_index=row_index,
-                        entry=entry,
-                        font=self._font_small_bold,
-                        on_toggle=self._on_folder_toggle,
-                        on_check=self._on_folder_check,
-                    )
-                    self._folder_rows[entry.relative_path] = row
-                else:
-                    row = _FileRow(
-                        self._tree_frame,
-                        row_index=row_index,
-                        entry=entry,
-                        font=self._font_small,
-                        on_select=self._on_file_select,
-                        on_check=self._on_check_change,
-                    )
-                    self._file_rows.append(row)
-
-                self._all_rows.append(row)
-
-            # Restore checkbox states
+            # Build the data model from the scan results.
+            self._tree_entries = entries
+            self._file_entries = [e for e in entries if e.kind == "file"]
+            self._folder_entries = {
+                e.relative_path: e for e in entries if e.kind == "folder"
+            }
+            # Files start checked (preserving the prior default); folders start
+            # expanded. A rename reload passes the previously-checked set instead.
             if checked_paths is not None:
-                for row in self._file_rows:
-                    row.set_checked(row.entry.path in checked_paths)
+                self._checked = {
+                    e.path: (e.path in checked_paths) for e in self._file_entries
+                }
+            else:
+                self._checked = {e.path: True for e in self._file_entries}
+            self._expanded = {rel: True for rel in self._folder_entries}
 
-            # Finalize tree structure
+            # Finalize tree structure and render the visible window.
             self._build_folder_descendants()
-            self._refresh_folder_selection_states()
-            self._apply_tree_visibility()
+            self._refresh_tree(reset_scroll=True)
             self._set_status(
-                f"Loaded {len(self._file_rows)} MP3 files from subfolders",
+                f"Loaded {len(self._file_entries)} MP3 files from subfolders",
                 state="ok",
             )
 
-            # Select target row
-            target_row = None
+            # Select target entry
+            target_entry = None
             if selected_path:
-                target_row = next(
-                    (row for row in self._file_rows if row.entry.path == selected_path),
+                target_entry = next(
+                    (e for e in self._file_entries if e.path == selected_path),
                     None,
                 )
-            if target_row is None and self._file_rows:
-                target_row = self._file_rows[0]
-            if target_row is not None:
-                self._on_file_select(target_row.entry.path, target_row)
+            if target_entry is None and self._file_entries:
+                target_entry = self._file_entries[0]
+            if target_entry is not None:
+                self._on_file_select(target_entry.path, target_entry)
 
         # Start background load
         def worker() -> None:
@@ -939,39 +945,53 @@ class App(ctk.CTk):
         return ancestors
 
     def _build_folder_descendants(self) -> None:
-        self._folder_descendants = {path: [] for path in self._folder_rows}
+        self._folder_descendants = {path: [] for path in self._folder_entries}
 
-        for file_row in self._file_rows:
-            for ancestor in self._ancestor_paths(file_row.entry.relative_path):
+        for file_entry in self._file_entries:
+            for ancestor in self._ancestor_paths(file_entry.relative_path):
                 if ancestor in self._folder_descendants:
-                    self._folder_descendants[ancestor].append(file_row)
+                    self._folder_descendants[ancestor].append(file_entry)
 
-    def _on_folder_toggle(self, _: str) -> None:
-        self._apply_tree_visibility()
+    def _on_row_check(self, entry: MP3TreeEntry, checked: bool) -> None:
+        """A checkbox was toggled in the tree view (folder or file)."""
+        if entry.kind == "folder":
+            descendants = self._folder_descendants.get(entry.relative_path, [])
+            for file_entry in descendants:
+                self._checked[file_entry.path] = checked
+            self._tree.refresh_visible()
+            self._update_counts()
+            if descendants:
+                action = "Selected" if checked else "Deselected"
+                self._set_status(
+                    f"{action} {len(descendants)} files in "
+                    f"{os.path.basename(entry.relative_path)}",
+                    state="ok",
+                )
+        else:
+            self._checked[entry.path] = checked
+            # Re-render so the row's ancestor folders update their tri-state count.
+            self._tree.refresh_visible()
+            self._update_counts()
 
-    def _on_folder_check(self, folder_relative_path: str, checked: bool) -> None:
-        descendants = self._folder_descendants.get(folder_relative_path, [])
-        for file_row in descendants:
-            file_row.set_checked(checked)
-
-        self._refresh_folder_selection_states()
-        self._update_counts()
-
-        if descendants:
-            action = "Selected" if checked else "Deselected"
-            self._set_status(
-                f"{action} {len(descendants)} files in {os.path.basename(folder_relative_path)}",
-                state="ok",
+    def _on_row_click(self, entry: MP3TreeEntry) -> None:
+        """A row's name was clicked: folders expand/collapse, files get selected."""
+        if entry.kind == "folder":
+            self._expanded[entry.relative_path] = not self._expanded.get(
+                entry.relative_path, True
             )
+            self._refresh_tree()
+        else:
+            self._on_file_select(entry.path, entry)
 
-    def _on_file_select(self, path: str, row: "_FileRow") -> None:
+    def _on_file_select(self, path: str, entry: MP3TreeEntry) -> None:
         self._store_current_file_draft()
 
-        for file_row in self._file_rows:
-            file_row.set_active(file_row is row)
-
         self._selected_file = path
-        self._selected_label.configure(text=row.entry.relative_path.replace("\\", " / "))
+        # Re-render visible rows so the active-row highlight follows the selection,
+        # then make sure the selected row is scrolled into view.
+        self._tree.refresh_visible()
+        self._tree.scroll_to(path)
+        self._selected_label.configure(text=entry.relative_path.replace("\\", " / "))
 
         self._cancel_load.set()
         cancel_token = threading.Event()
@@ -998,10 +1018,6 @@ class App(ctk.CTk):
             self.after(0, update_ui)
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def _on_check_change(self) -> None:
-        self._refresh_folder_selection_states()
-        self._update_counts()
 
     def _clear_form(self) -> None:
         for entry in self._entries.values():
@@ -1191,20 +1207,22 @@ class App(ctk.CTk):
         return dialog.show()
 
     def _toggle_all(self) -> None:
-        if not self._file_rows:
+        if not self._file_entries:
             self._set_status("No files available to select", state="error")
             return
 
-        should_check = not all(row.checked for row in self._file_rows)
-        for row in self._file_rows:
-            row.set_checked(should_check)
+        should_check = not all(
+            self._checked.get(e.path) for e in self._file_entries
+        )
+        for entry in self._file_entries:
+            self._checked[entry.path] = should_check
 
-        self._refresh_folder_selection_states()
+        self._tree.refresh_visible()
         self._update_counts()
         if should_check:
-            self._set_status(f"Selected {len(self._file_rows)} files", state="ok")
+            self._set_status(f"Selected {len(self._file_entries)} files", state="ok")
         else:
-            self._set_status(f"Deselected {len(self._file_rows)} files", state="ok")
+            self._set_status(f"Deselected {len(self._file_entries)} files", state="ok")
 
     def _rename_selected_file(self) -> None:
         self._store_current_file_draft()
@@ -1229,9 +1247,7 @@ class App(ctk.CTk):
             return
 
         old_path = self._selected_file
-        checked_paths = {
-            row.entry.path for row in self._file_rows if row.checked
-        }
+        checked_paths = set(self._checked_paths())
 
         self._set_status("Renaming file...", state="busy")
 
@@ -1265,11 +1281,7 @@ class App(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _checked_paths(self) -> List[str]:
-        return [row.entry.path for row in self._file_rows if row.checked]
-
-    def _search_matches(self, row: "_TreeRowBase", query: str) -> bool:
-        search_text = row.entry.relative_path.replace("\\", "/").lower()
-        return query in search_text
+        return [e.path for e in self._file_entries if self._checked.get(e.path)]
 
     def _schedule_tree_filter(self) -> None:
         """Debounce filter input so visibility recomputes once typing settles.
@@ -1284,65 +1296,108 @@ class App(ctk.CTk):
 
     def _run_tree_filter(self) -> None:
         self._search_job = None
-        self._apply_tree_visibility()
+        self._refresh_tree()
 
-    def _apply_tree_visibility(self) -> None:
+    def _refresh_tree(self, *, reset_scroll: bool = False) -> None:
+        """Recompute the flattened visible-row list and hand it to the view.
+
+        This is the single entry point that turns the data model (expanded /
+        collapsed folders + the search filter) into the ordered list of rows the
+        virtualized view renders.
+        """
+        self._recompute_visible()
+        self._tree.set_items(self._visible_entries, reset=reset_scroll)
+        self._update_counts()
+
+    def _recompute_visible(self) -> None:
         query = self._search_var.get().strip().lower()
-
         if query:
             visible_paths = self._visible_paths_for_query(query)
-            for row in self._all_rows:
-                if row.entry.relative_path in visible_paths:
-                    row.show()
-                else:
-                    row.hide()
+            self._visible_entries = [
+                e for e in self._tree_entries if e.relative_path in visible_paths
+            ]
         else:
-            for row in self._all_rows:
-                if self._has_collapsed_ancestor(row):
-                    row.hide()
-                else:
-                    row.show()
-
-        self._update_counts()
+            self._visible_entries = [
+                e for e in self._tree_entries if not self._has_collapsed_ancestor(e)
+            ]
 
     def _visible_paths_for_query(self, query: str) -> set[str]:
         visible_paths: set[str] = set()
         separator = os.sep
 
-        for folder_row in self._folder_rows.values():
-            if not self._search_matches(folder_row, query):
+        for folder in self._folder_entries.values():
+            if query not in folder.relative_path.replace("\\", "/").lower():
                 continue
 
-            visible_paths.add(folder_row.entry.relative_path)
-            visible_paths.update(self._ancestor_paths(folder_row.entry.relative_path))
+            visible_paths.add(folder.relative_path)
+            visible_paths.update(self._ancestor_paths(folder.relative_path))
 
-            prefix = folder_row.entry.relative_path + separator
-            for row in self._all_rows:
-                if row.entry.relative_path == folder_row.entry.relative_path:
-                    visible_paths.add(row.entry.relative_path)
-                elif row.entry.relative_path.startswith(prefix):
-                    visible_paths.add(row.entry.relative_path)
+            prefix = folder.relative_path + separator
+            for entry in self._tree_entries:
+                if entry.relative_path == folder.relative_path:
+                    visible_paths.add(entry.relative_path)
+                elif entry.relative_path.startswith(prefix):
+                    visible_paths.add(entry.relative_path)
 
-        for file_row in self._file_rows:
-            if not self._search_matches(file_row, query):
+        for file_entry in self._file_entries:
+            if query not in file_entry.relative_path.replace("\\", "/").lower():
                 continue
 
-            visible_paths.add(file_row.entry.relative_path)
-            visible_paths.update(self._ancestor_paths(file_row.entry.relative_path))
+            visible_paths.add(file_entry.relative_path)
+            visible_paths.update(self._ancestor_paths(file_entry.relative_path))
 
         return visible_paths
 
-    def _has_collapsed_ancestor(self, row: "_TreeRowBase") -> bool:
-        for ancestor in self._ancestor_paths(row.entry.relative_path):
-            ancestor_row = self._folder_rows.get(ancestor)
-            if ancestor_row and not ancestor_row.expanded:
+    def _has_collapsed_ancestor(self, entry: MP3TreeEntry) -> bool:
+        for ancestor in self._ancestor_paths(entry.relative_path):
+            if ancestor in self._folder_entries and not self._expanded.get(
+                ancestor, True
+            ):
                 return True
         return False
 
+    def _bind_tree_row(self, row: "_PooledRow", entry: MP3TreeEntry) -> None:
+        """View callback: render a recycled pooled row for ``entry``.
+
+        Pulls all per-row state from the data model (checked / expanded /
+        active / folder tri-state count) — the row widgets hold no state of
+        their own, which is what lets the pool be recycled during scroll.
+        """
+        indent = 14 + entry.depth * 20
+        if entry.kind == "folder":
+            descendants = self._folder_descendants.get(entry.relative_path, [])
+            total = len(descendants)
+            checked = sum(1 for e in descendants if self._checked.get(e.path))
+            if total == 0:
+                count_text, count_color = "0/0", C_MUTED
+            else:
+                count_text = f"{checked}/{total}"
+                if 0 < checked < total:
+                    count_color = C_ACCENT
+                elif checked == total:
+                    count_color = C_TEXT
+                else:
+                    count_color = C_MUTED
+            row.bind_folder(
+                entry,
+                indent=indent,
+                checked_all=total > 0 and checked == total,
+                count_text=count_text,
+                count_color=count_color,
+                expanded=self._expanded.get(entry.relative_path, True),
+            )
+        else:
+            row.bind_file(
+                entry,
+                indent=indent,
+                checked=self._checked.get(entry.path, False),
+                active=entry.path == self._selected_file,
+            )
+
     def _update_counts(self) -> None:
-        total_files = len(self._file_rows)
-        visible_files = sum(1 for row in self._file_rows if row.is_visible)
-        checked_files = sum(1 for row in self._file_rows if row.checked)
+        total_files = len(self._file_entries)
+        visible_files = sum(1 for e in self._visible_entries if e.kind == "file")
+        checked_files = sum(1 for e in self._file_entries if self._checked.get(e.path))
 
         if self._search_var.get().strip():
             badge_text = f"{visible_files}/{total_files} files"
@@ -1363,13 +1418,6 @@ class App(ctk.CTk):
             self._select_all_button.configure(text="Deselect All")
         else:
             self._select_all_button.configure(text="Select All")
-
-    def _refresh_folder_selection_states(self) -> None:
-        for folder_path, folder_row in self._folder_rows.items():
-            descendants = self._folder_descendants.get(folder_path, [])
-            total_files = len(descendants)
-            checked_files = sum(1 for row in descendants if row.checked)
-            folder_row.set_selection_state(checked_files, total_files)
 
     def _fill_titles(self) -> None:
         paths = self._checked_paths()
@@ -1513,67 +1561,47 @@ class App(ctk.CTk):
         self._status_dot.configure(fg_color=dot_color)
 
 
-class _TreeRowBase(ctk.CTkFrame):
+class _PooledRow(ctk.CTkFrame):
+    """A single recycled tree row.
+
+    The view keeps a small pool of these and re-points them at different model
+    entries as the user scrolls, so the widget count stays constant (about one
+    screen's worth) regardless of library size. The row holds no persistent
+    state of its own: ``bind_folder`` / ``bind_file`` push everything in from the
+    model, which is what makes the pool safe to recycle.
+    """
+
     def __init__(
         self,
         master,
-        row_index: int,
-        entry: MP3TreeEntry,
         *,
         font,
+        font_bold,
+        on_check: Callable[["_PooledRow"], None],
+        on_click: Callable[["_PooledRow"], None],
+        on_wheel: Callable,
     ) -> None:
         super().__init__(master, fg_color="transparent", corner_radius=8)
-        self.entry = entry
-        self._row_index = row_index
-        self._is_visible = True
+        self.entry: Optional[MP3TreeEntry] = None
+        self._model_index = -1
+        self._kind: Optional[str] = None
+        self._active = False
+        self._hovered = False
         self._font = font
-        self._indent_width = 14 + (entry.depth * 20)
+        self._font_bold = font_bold
+        self._on_check = on_check
+        self._on_click = on_click
 
-        self.grid(row=row_index, column=0, sticky="ew", pady=(0, 3), padx=4)
         self.grid_columnconfigure(3, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
         self._indent = ctk.CTkFrame(
-            self,
-            width=self._indent_width,
-            fg_color="transparent",
+            self, width=14, height=_TREE_ROW_HEIGHT, fg_color="transparent"
         )
         self._indent.grid(row=0, column=0, sticky="nsw")
         self._indent.grid_propagate(False)
-        self._indent.configure(height=30)
 
-    @property
-    def is_visible(self) -> bool:
-        return self._is_visible
-
-    def show(self) -> None:
-        if not self._is_visible:
-            self.grid()
-            self._is_visible = True
-
-    def hide(self) -> None:
-        if self._is_visible:
-            self.grid_remove()
-            self._is_visible = False
-
-
-class _FolderRow(_TreeRowBase):
-    def __init__(
-        self,
-        master,
-        row_index: int,
-        entry: MP3TreeEntry,
-        *,
-        font,
-        on_toggle: Callable[[str], None],
-        on_check: Callable[[str, bool], None],
-    ) -> None:
-        super().__init__(master, row_index, entry, font=font)
-        self.expanded = True
-        self._on_toggle = on_toggle
-        self._on_check = on_check
-        self._checked_var = tk.BooleanVar(value=True)
-        self._syncing_state = False
-
+        self._checked_var = tk.BooleanVar(value=False)
         self._checkbox = ctk.CTkCheckBox(
             self,
             text="",
@@ -1585,122 +1613,21 @@ class _FolderRow(_TreeRowBase):
             hover_color=C_ACCENT_HOVER,
             border_width=2,
             border_color=C_BORDER,
-            command=self._checkbox_toggled,
+            command=lambda: self._on_check(self),
         )
-        self._checkbox.grid(row=0, column=1, padx=(0, 2), pady=4)
+        self._checkbox.grid(row=0, column=1, padx=(0, 2))
 
-        self._button = ctk.CTkButton(
-            self,
-            text="",
-            font=font,
-            anchor="w",
-            fg_color="transparent",
-            hover_color=C_ROW_HOVER,
-            text_color=C_TEXT,
-            corner_radius=6,
-            height=30,
-            command=self._toggle,
-        )
-        self._button.grid(
-            row=0,
-            column=3,
-            sticky="ew",
-            padx=(0, 8),
-            pady=2,
-        )
-
+        # The branch arrow (folders only) and the right-aligned tri-state count
+        # (folders only) are gridded / ungridded by ``_layout_for`` per kind.
         self._branch_label = ctk.CTkLabel(
-            self,
-            text="",
-            font=font,
-            text_color=C_MUTED,
-            width=14,
+            self, text="", font=font_bold, text_color=C_MUTED, width=14
         )
-        self._branch_label.grid(row=0, column=2, sticky="w", padx=(0, 2))
-
         self._count_label = ctk.CTkLabel(
-            self,
-            text="0/0",
-            font=font,
-            text_color=C_MUTED,
-            anchor="e",
-            width=54,
+            self, text="", font=font_bold, text_color=C_MUTED, anchor="e", width=54
         )
-        self._count_label.grid(row=0, column=4, sticky="e", padx=(0, 8))
-        self._refresh()
-
-    def _checkbox_toggled(self) -> None:
-        if self._syncing_state:
-            return
-        self._on_check(self.entry.relative_path, self._checked_var.get())
-
-    def _toggle(self) -> None:
-        self.expanded = not self.expanded
-        self._refresh()
-        self._on_toggle(self.entry.relative_path)
-
-    def set_selection_state(self, checked_files: int, total_files: int) -> None:
-        self._syncing_state = True
-        self._checked_var.set(total_files > 0 and checked_files == total_files)
-        self._syncing_state = False
-
-        if total_files == 0:
-            self._count_label.configure(text="0/0", text_color=C_MUTED)
-        else:
-            count_text = f"{checked_files}/{total_files}"
-            if 0 < checked_files < total_files:
-                text_color = C_ACCENT
-            elif checked_files == total_files:
-                text_color = C_TEXT
-            else:
-                text_color = C_MUTED
-            self._count_label.configure(text=count_text, text_color=text_color)
-
-    def _refresh(self) -> None:
-        prefix = "▾" if self.expanded else "▸"
-        self._branch_label.configure(text=prefix)
-        self._button.configure(text=self.entry.name)
-
-
-class _FileRow(_TreeRowBase):
-    def __init__(
-        self,
-        master,
-        row_index: int,
-        entry: MP3TreeEntry,
-        *,
-        font,
-        on_select: Callable[[str, "_FileRow"], None],
-        on_check: Callable[[], None],
-    ) -> None:
-        super().__init__(master, row_index, entry, font=font)
-        self._on_select = on_select
-        self._on_check = on_check
-        self._active = False
-        self._hovered = False
-        self._checked_var = tk.BooleanVar(value=True)
-
-        self._checkbox = ctk.CTkCheckBox(
-            self,
-            text="",
-            variable=self._checked_var,
-            width=18,
-            checkbox_width=16,
-            checkbox_height=16,
-            fg_color=C_ACCENT,
-            hover_color=C_ACCENT_HOVER,
-            border_width=2,
-            border_color=C_BORDER,
-            command=self._check_changed,
-        )
-        self._checkbox.grid(row=0, column=1, padx=(0, 2), pady=4)
-
-        # Files carry no leading marker: the name sits right next to the
-        # checkbox. Spans the marker + name columns so it stays tight while
-        # hierarchy is conveyed by the depth indent in column 0.
         self._button = ctk.CTkButton(
             self,
-            text=entry.name,
+            text="",
             font=font,
             anchor="w",
             fg_color="transparent",
@@ -1708,38 +1635,102 @@ class _FileRow(_TreeRowBase):
             text_color=C_TEXT,
             corner_radius=6,
             height=30,
-            command=lambda: self._on_select(entry.path, self),
-        )
-        self._button.grid(
-            row=0, column=2, columnspan=2, sticky="ew", padx=(2, 8), pady=2
+            command=lambda: self._on_click(self),
         )
 
+        # Hover highlight (file rows only) mirrors the original _FileRow.
         for widget in (self, self._button):
-            widget.bind("<Enter>", lambda _event: self._set_hover(True))
-            widget.bind("<Leave>", lambda _event: self._set_hover(False))
+            widget.bind("<Enter>", lambda _e: self._set_hover(True))
+            widget.bind("<Leave>", lambda _e: self._set_hover(False))
+
+        # Wheel events anywhere on the row drive the virtualized scroll.
+        for widget in (
+            self,
+            self._indent,
+            self._checkbox,
+            self._branch_label,
+            self._count_label,
+            self._button,
+        ):
+            widget.bind("<MouseWheel>", on_wheel)
 
     @property
     def checked(self) -> bool:
         return self._checked_var.get()
 
-    def set_checked(self, value: bool) -> None:
-        self._checked_var.set(value)
+    def _layout_for(self, kind: str) -> None:
+        """(Re)grid the name / branch / count for the given kind.
 
-    def set_active(self, active: bool) -> None:
+        Folders show a branch arrow before the name and a tri-state count after
+        it; files keep the name tight against the checkbox (spanning the branch
+        column) with no count. We only re-grid when the slot's kind actually
+        changes, so steady scrolling over same-kind rows pays nothing here.
+        """
+        if self._kind == kind:
+            return
+        self._kind = kind
+        self._button.grid_forget()
+        self._branch_label.grid_forget()
+        self._count_label.grid_forget()
+        if kind == "folder":
+            self._branch_label.grid(row=0, column=2, sticky="w", padx=(0, 2))
+            self._button.grid(row=0, column=3, sticky="ew", padx=(0, 8))
+            self._count_label.grid(row=0, column=4, sticky="e", padx=(0, 8))
+        else:
+            self._button.grid(
+                row=0, column=2, columnspan=2, sticky="ew", padx=(2, 8)
+            )
+
+    def bind_folder(
+        self,
+        entry: MP3TreeEntry,
+        *,
+        indent: int,
+        checked_all: bool,
+        count_text: str,
+        count_color,
+        expanded: bool,
+    ) -> None:
+        self.entry = entry
+        self._active = False
+        self._hovered = False
+        self._layout_for("folder")
+        self._indent.configure(width=indent)
+        self._checked_var.set(checked_all)
+        self._branch_label.configure(text="▾" if expanded else "▸")
+        self._count_label.configure(text=count_text, text_color=count_color)
+        self._button.configure(
+            text=entry.name, font=self._font_bold, text_color=C_TEXT
+        )
+        self.configure(fg_color="transparent")
+
+    def bind_file(
+        self,
+        entry: MP3TreeEntry,
+        *,
+        indent: int,
+        checked: bool,
+        active: bool,
+    ) -> None:
+        self.entry = entry
         self._active = active
-        self._refresh()
-
-    def _check_changed(self) -> None:
-        self._on_check()
+        self._hovered = False
+        self._layout_for("file")
+        self._indent.configure(width=indent)
+        self._checked_var.set(checked)
+        self._button.configure(text=entry.name, font=self._font)
+        self._apply_file_colors()
 
     def _set_hover(self, hovered: bool) -> None:
+        if self._kind != "file":
+            return
         self._hovered = hovered
-        self._refresh()
+        self._apply_file_colors()
 
-    def _refresh(self) -> None:
+    def _apply_file_colors(self) -> None:
         if self._active:
             self.configure(fg_color=C_ROW_SELECTED)
-            self._button.configure(text_color=("#1d4ed8", "#93c5fd"))
+            self._button.configure(text_color=C_ROW_SELECTED_TEXT)
         elif self._hovered:
             self.configure(fg_color=C_ROW_HOVER)
             self._button.configure(text_color=C_TEXT)
@@ -1747,6 +1738,198 @@ class _FileRow(_TreeRowBase):
             self.configure(fg_color="transparent")
             self._button.configure(text_color=C_TEXT)
 
+
+class _VirtualTree(ctk.CTkFrame):
+    """Virtualized folder-tree view.
+
+    Renders only the rows in the current viewport using a recycled pool of
+    ``_PooledRow`` widgets placed at absolute y-positions. With a fixed row
+    height a scroll offset maps directly to a model-index range, so widget count
+    and redraw cost stay flat whether the library has 50 files or 50,000.
+
+    All row STATE (checked / expanded / active / counts) lives in the owner
+    (``App``); this view only knows the ordered list of currently-visible
+    entries and asks ``bind_row`` to paint each pooled widget.
+    """
+
+    def __init__(
+        self,
+        master,
+        *,
+        bind_row: Callable[["_PooledRow", MP3TreeEntry], None],
+        on_check: Callable[[MP3TreeEntry, bool], None],
+        on_click: Callable[[MP3TreeEntry], None],
+        font,
+        font_bold,
+    ) -> None:
+        super().__init__(master, fg_color=C_SURFACE, corner_radius=0)
+        self._bind_row = bind_row
+        self._on_check_cb = on_check
+        self._on_click_cb = on_click
+        self._font = font
+        self._font_bold = font_bold
+
+        self._items: List[MP3TreeEntry] = []
+        self._item_index: Dict[str, int] = {}
+        self._pool: List[_PooledRow] = []
+        self._offset = 0
+        self._last_body_h = 0
+
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self._body = ctk.CTkFrame(self, fg_color=C_SURFACE, corner_radius=0)
+        self._body.grid(row=0, column=0, sticky="nsew")
+
+        self._scrollbar = ctk.CTkScrollbar(
+            self,
+            command=self._on_scrollbar,
+            button_color=C_BORDER,
+            button_hover_color=C_MUTED,
+        )
+        self._scrollbar.grid(row=0, column=1, sticky="ns", padx=(2, 0))
+
+        self._body.bind("<Configure>", self._on_body_configure)
+        for widget in (self, self._body):
+            widget.bind("<MouseWheel>", self._on_wheel)
+
+    # ---- public API used by App -------------------------------------------
+
+    def set_items(self, items: List[MP3TreeEntry], *, reset: bool = False) -> None:
+        self._items = items
+        self._item_index = {entry.path: i for i, entry in enumerate(items)}
+        if reset:
+            self._offset = 0
+        # Content changed: invalidate every slot so it rebinds.
+        for slot in self._pool:
+            slot._model_index = -1
+        self._redraw(force=True)
+
+    def refresh_visible(self) -> None:
+        """Rebind the currently-visible rows (state changed, list did not)."""
+        self._redraw(force=True)
+
+    def scroll_to(self, path: str) -> None:
+        idx = self._item_index.get(path)
+        if idx is None:
+            return
+        height = self._body_height()
+        top = idx * _TREE_ROW_HEIGHT
+        bottom = top + _TREE_ROW_HEIGHT
+        if top < self._offset:
+            self._offset = top
+        elif bottom > self._offset + height:
+            self._offset = bottom - height
+        self._redraw()
+
+    # ---- scroll plumbing ---------------------------------------------------
+
+    def _body_height(self) -> int:
+        height = self._body.winfo_height()
+        if height <= 1:
+            height = self._last_body_h or 400
+        return height
+
+    def _on_body_configure(self, event) -> None:
+        self._last_body_h = event.height
+        self._redraw()
+
+    def _on_wheel(self, event) -> str:
+        if not self._items:
+            return "break"
+        if event.delta:
+            steps = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)
+        else:
+            steps = 0
+        self._offset += steps * _TREE_ROW_HEIGHT * _TREE_WHEEL_ROWS
+        self._redraw()
+        return "break"
+
+    def _on_scrollbar(self, *args) -> None:
+        if not self._items:
+            return
+        total_h = len(self._items) * _TREE_ROW_HEIGHT
+        height = self._body_height()
+        if args[0] == "moveto":
+            self._offset = int(float(args[1]) * total_h)
+        elif args[0] == "scroll":
+            amount = int(args[1])
+            unit = args[2]
+            if unit == "units":
+                self._offset += amount * _TREE_ROW_HEIGHT * _TREE_WHEEL_ROWS
+            else:
+                self._offset += amount * height
+        self._redraw()
+
+    def _handle_check(self, row: "_PooledRow") -> None:
+        if row.entry is not None:
+            self._on_check_cb(row.entry, row.checked)
+
+    def _handle_click(self, row: "_PooledRow") -> None:
+        if row.entry is not None:
+            self._on_click_cb(row.entry)
+
+    def _ensure_pool(self, size: int) -> None:
+        while len(self._pool) < size:
+            row = _PooledRow(
+                self._body,
+                font=self._font,
+                font_bold=self._font_bold,
+                on_check=self._handle_check,
+                on_click=self._handle_click,
+                on_wheel=self._on_wheel,
+            )
+            row._model_index = -1
+            self._pool.append(row)
+
+    # ---- the core redraw ---------------------------------------------------
+
+    def _redraw(self, force: bool = False) -> None:
+        total = len(self._items)
+        height = self._body_height()
+        total_h = total * _TREE_ROW_HEIGHT
+        max_offset = max(0, total_h - height)
+        self._offset = max(0, min(self._offset, max_offset))
+        offset = self._offset
+
+        if total == 0:
+            for slot in self._pool:
+                if slot._model_index != -1:
+                    slot.place_forget()
+                    slot._model_index = -1
+            self._scrollbar.set(0.0, 1.0)
+            return
+
+        first = offset // _TREE_ROW_HEIGHT
+        window = height // _TREE_ROW_HEIGHT + 2
+        last = min(total - 1, first + window)
+
+        # Pool must exceed the window so distinct visible indices never collide
+        # under the modulo slot assignment below.
+        self._ensure_pool(window + 2)
+        pool_size = len(self._pool)
+
+        used = set()
+        for m in range(first, last + 1):
+            slot_index = m % pool_size
+            slot = self._pool[slot_index]
+            used.add(slot_index)
+            if force or slot._model_index != m:
+                self._bind_row(slot, self._items[m])
+                slot._model_index = m
+            slot.place(
+                x=0,
+                y=m * _TREE_ROW_HEIGHT - offset,
+                relwidth=1.0,
+                height=_TREE_ROW_HEIGHT,
+            )
+
+        for slot_index, slot in enumerate(self._pool):
+            if slot_index not in used and slot._model_index != -1:
+                slot.place_forget()
+                slot._model_index = -1
+
+        self._scrollbar.set(offset / total_h, min(1.0, (offset + height) / total_h))
 
 class _ConfirmDialog(ctk.CTkToplevel):
     def __init__(
