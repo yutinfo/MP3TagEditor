@@ -224,8 +224,14 @@ class App(ctk.CTk):
         self._search_job: Optional[str] = None
         self._left_width = _LEFT_PANEL_DEFAULT_WIDTH
         self._splitter_dragging = False
+        self._fill_layout_locked = False
 
         self._build_ui()
+
+        # Lock the fill-containers so they stop shrink-wrapping to the
+        # virtualized tree's tiny natural height (see _lock_fill_layout). We poll
+        # until the window has a real size, because locking at 1x1 freezes it.
+        self.after(50, self._lock_fill_layout)
 
     def _detect_font_family(self) -> str:
         available_fonts = set(tkfont.families(self))
@@ -251,6 +257,27 @@ class App(ctk.CTk):
         self._build_splitter(content)
         self._build_editor_panel(content)
         self._build_status_bar()
+
+    def _lock_fill_layout(self) -> None:
+        """Stop the tree's fill-containers from shrink-wrapping their children.
+
+        `content` and the folder-tree panel are sized by their parent geometry
+        manager (pack-expand / weighted grid cell), not by their content. The
+        virtualized tree's rows are place()d and request no height, so with
+        geometry propagation left on, the weighted tree row collapses and drags
+        the whole left panel down to ~header height. Disabling propagation fixes
+        it — but only once real sizes exist, so we poll until the window is laid
+        out (locking at 1x1 would freeze the panels at that size).
+        """
+        if self._fill_layout_locked:
+            return
+        if self._content.winfo_height() <= 1:
+            self.after(50, self._lock_fill_layout)
+            return
+        self._fill_layout_locked = True
+        self._content.grid_propagate(False)
+        self._file_panel.grid_propagate(False)
+        self._tree.lock_fill()
 
     def _build_topbar(self) -> None:
         bar = ctk.CTkFrame(self, height=56, corner_radius=0, fg_color=C_SURFACE)
@@ -1581,7 +1608,15 @@ class _PooledRow(ctk.CTkFrame):
         on_click: Callable[["_PooledRow"], None],
         on_wheel: Callable,
     ) -> None:
-        super().__init__(master, fg_color="transparent", corner_radius=8)
+        # Fixed height is set in the constructor (not in place()) because CTk's
+        # place() wrapper rejects width/height kwargs; the virtualized layout
+        # positions each row by y-offset and relies on this constant height.
+        super().__init__(
+            master,
+            fg_color="transparent",
+            corner_radius=8,
+            height=_TREE_ROW_HEIGHT,
+        )
         self.entry: Optional[MP3TreeEntry] = None
         self._model_index = -1
         self._kind: Optional[str] = None
@@ -1795,6 +1830,18 @@ class _VirtualTree(ctk.CTkFrame):
 
     # ---- public API used by App -------------------------------------------
 
+    def lock_fill(self) -> None:
+        """Stop the tree/body from shrink-wrapping their (place()d) children.
+
+        The body's rows are positioned with place() and contribute no requested
+        height, so with geometry propagation on, the tree would collapse instead
+        of filling its parent cell. This must run *after* the first map — doing
+        it while the widgets are still 1x1 would freeze them at that size.
+        """
+        self.grid_propagate(False)
+        self._body.grid_propagate(False)
+        self._redraw(force=True)
+
     def set_items(self, items: List[MP3TreeEntry], *, reset: bool = False) -> None:
         self._items = items
         self._item_index = {entry.path: i for i, entry in enumerate(items)}
@@ -1917,12 +1964,9 @@ class _VirtualTree(ctk.CTkFrame):
             if force or slot._model_index != m:
                 self._bind_row(slot, self._items[m])
                 slot._model_index = m
-            slot.place(
-                x=0,
-                y=m * _TREE_ROW_HEIGHT - offset,
-                relwidth=1.0,
-                height=_TREE_ROW_HEIGHT,
-            )
+            # Height comes from the row's constructor (CTk's place() forbids it);
+            # relwidth makes the row span the body width minus the scrollbar.
+            slot.place(x=0, y=m * _TREE_ROW_HEIGHT - offset, relwidth=1.0)
 
         for slot_index, slot in enumerate(self._pool):
             if slot_index not in used and slot._model_index != -1:
@@ -1930,6 +1974,7 @@ class _VirtualTree(ctk.CTkFrame):
                 slot._model_index = -1
 
         self._scrollbar.set(offset / total_h, min(1.0, (offset + height) / total_h))
+
 
 class _ConfirmDialog(ctk.CTkToplevel):
     def __init__(

@@ -42,9 +42,9 @@ Two modules, clean separation:
   pieces: `FRAME_MAP` (field → ID3 frame), `list_mp3_tree()` (recursive scan →
   `MP3TreeEntry` list), `load_mp3_tags()` / `save_tags()`, cover helpers, `rename_mp3_file()`,
   and `_try_fix_thai_encoding()`.
-- **`main.py`** — all UI. `App(ctk.CTk)` is the root; `_LoadingOverlay`, `_TreeRowBase` /
-  `_FolderRow` / `_FileRow`, and `_ConfirmDialog` are the widgets. `App` owns window setup,
-  the folder tree, per-file drafts, and every user action (`_save`, `_rename_selected_file`,
+- **`main.py`** — all UI. `App(ctk.CTk)` is the root; `_LoadingOverlay`, `_VirtualTree` /
+  `_PooledRow`, and `_ConfirmDialog` are the widgets. `App` owns window setup, the folder
+  tree, per-file drafts, and every user action (`_save`, `_rename_selected_file`,
   `_fill_titles`, `_apply_cover`, `_remove_cover`).
 
 `AI-HANDOFF.md` and the `README.md` carry additional context on intended behavior — read them
@@ -83,6 +83,20 @@ the detected `CTkFont` for any text that may contain Thai.
 **6. Reads never write.** `load_mp3_tags()` catches `ID3NoHeaderError` and returns empty
 strings rather than creating an ID3 header. Keep reads side-effect-free; only explicit
 save/cover/rename actions touch disk.
+
+**7. The folder tree is virtualized — state lives in the model, not widgets.** The tree
+renders only the rows in the viewport via a recycled pool (`_VirtualTree` + `_PooledRow`),
+so it stays smooth for 1000+ files. Per-row state is plain data on `App`
+(`self._tree_entries`, `self._file_entries`, `self._folder_entries`, `self._checked` keyed by
+file path, `self._expanded` keyed by folder relpath, `self._folder_descendants`). The pooled
+row widgets are stateless: `App._bind_tree_row()` paints each one from the model on demand, so
+**never store per-entry state on a row** (it gets recycled during scroll). After any model
+change, call `self._tree.refresh_visible()` (re-paint visible rows) or `self._refresh_tree()`
+(recompute the flattened visible list — for expand/collapse and search). Row height is fixed
+(`_TREE_ROW_HEIGHT`); the offset↔index math depends on it. The fill-containers
+(`content`/`_file_panel`/`_VirtualTree`/`_body`) have geometry propagation disabled via
+`_lock_fill_layout()` once the window is mapped — without it the place()d rows (no requested
+height) let the panel collapse; don't re-enable propagation on them.
 
 ## Gotchas
 
